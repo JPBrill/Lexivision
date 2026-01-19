@@ -1,0 +1,8 @@
+{
+  "name": "LexiVision AI - Interactive Visual Dictionary",
+  "description": "A high-end visual dictionary app that generates definitions, AI images, and animations for words, featuring conversational speech practice and advanced image editing.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
