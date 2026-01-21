@@ -2,10 +2,53 @@
 import { GoogleGenAI, Type, GenerateContentResponse } from "@google/genai";
 import { WordEntry } from "../types";
 
+export interface QuizQuestion {
+  question: string;
+  options: string[];
+  correctIndex: number;
+  difficulty: 'Beginner' | 'Intermediate' | 'Advanced';
+}
+
 export class GeminiService {
   private get ai() {
-    // Create a fresh instance for every call to ensure correct environment key usage
-    return new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
+    // Strictly use process.env.API_KEY as per the library guidelines.
+    // Always initialize new instance to ensure the most up-to-date configuration.
+    return new GoogleGenAI({ apiKey: process.env.API_KEY });
+  }
+
+  async generateProficiencyQuiz(): Promise<QuizQuestion[]> {
+    const response = await this.ai.models.generateContent({
+      model: 'gemini-3-flash-preview',
+      contents: `Generate a 3-question English proficiency quiz. 
+      Question 1 should be Beginner level.
+      Question 2 should be Intermediate level.
+      Question 3 should be Advanced level.
+      Format the output as a JSON array of objects with 'question', 'options' (4 choices), 'correctIndex', and 'difficulty'.`,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              question: { type: Type.STRING },
+              options: { type: Type.ARRAY, items: { type: Type.STRING } },
+              correctIndex: { type: Type.NUMBER },
+              difficulty: { type: Type.STRING },
+            },
+            required: ["question", "options", "correctIndex", "difficulty"],
+          }
+        },
+      },
+    });
+
+    try {
+      // Direct access to .text property as per guidelines
+      return JSON.parse(response.text || '[]');
+    } catch (e) {
+      console.error("Failed to generate quiz", e);
+      return [];
+    }
   }
 
   async generateWordOfTheDay(): Promise<Partial<WordEntry>> {
@@ -101,6 +144,7 @@ export class GeminiService {
       }
     });
 
+    // Iterate through candidates and parts to find the image part as per guidelines
     for (const part of response.candidates?.[0]?.content?.parts || []) {
       if (part.inlineData) {
         return `data:image/png;base64,${part.inlineData.data}`;
@@ -130,45 +174,6 @@ export class GeminiService {
       if (part.inlineData) {
         return `data:image/png;base64,${part.inlineData.data}`;
       }
-    }
-    return null;
-  }
-
-  async animateWithVeo(imageUri: string, prompt: string): Promise<string | null> {
-    const base64Data = imageUri.split(',')[1] || imageUri;
-    const aiInstance = this.ai;
-    
-    try {
-      let operation = await aiInstance.models.generateVideos({
-        model: 'veo-3.1-fast-generate-preview',
-        prompt: prompt || 'Animate this image subtly to bring it to life.',
-        image: {
-          imageBytes: base64Data,
-          mimeType: 'image/png',
-        },
-        config: {
-          numberOfVideos: 1,
-          resolution: '720p',
-          aspectRatio: '16:9'
-        }
-      });
-
-      while (!operation.done) {
-        await new Promise(resolve => setTimeout(resolve, 5000));
-        operation = await aiInstance.operations.getVideosOperation({ operation: operation });
-      }
-
-      const downloadLink = operation.response?.generatedVideos?.[0]?.video?.uri;
-      if (downloadLink) {
-        const videoResponse = await fetch(`${downloadLink}&key=${process.env.API_KEY}`);
-        const blob = await videoResponse.blob();
-        return URL.createObjectURL(blob);
-      }
-    } catch (e: any) {
-      if (e.message?.includes("404") || e.message?.includes("not found")) {
-        throw new Error("Video generation is unavailable on the current free tier.");
-      }
-      throw e;
     }
     return null;
   }

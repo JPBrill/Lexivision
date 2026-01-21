@@ -7,7 +7,6 @@ export interface WordEntry {
   partOfSpeech: string;
   example: string;
   imageUrl: string | null;
-  videoUrl: string | null;
   listId: string;
   createdAt: number;
   overlay?: {
@@ -38,7 +37,6 @@ export interface User {
 }
 
 export enum AppView {
-  AUTH = 'AUTH',
   ONBOARDING = 'ONBOARDING',
   DICTIONARY = 'DICTIONARY',
   LISTS = 'LISTS',

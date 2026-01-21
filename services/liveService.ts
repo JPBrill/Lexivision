@@ -1,5 +1,5 @@
 
-import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
+import { GoogleGenAI, LiveServerMessage, Modality, Type, FunctionDeclaration } from '@google/genai';
 
 function decode(base64: string) {
   const binaryString = atob(base64);
@@ -39,123 +39,151 @@ function encode(bytes: Uint8Array) {
   return btoa(binary);
 }
 
+const closeSessionDeclaration: FunctionDeclaration = {
+  name: 'closePracticeSession',
+  parameters: {
+    type: Type.OBJECT,
+    description: 'Call this function to exit or end the practice session.',
+    properties: {
+      reason: {
+        type: Type.STRING,
+        description: 'The reason for closing.',
+      }
+    },
+    required: ['reason'],
+  },
+};
+
 export class LiveSessionManager {
   private get ai() {
-    return new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
+    // Strictly use process.env.API_KEY as per the library guidelines.
+    return new GoogleGenAI({ apiKey: process.env.API_KEY });
   }
   private inputAudioContext: AudioContext | null = null;
   private outputAudioContext: AudioContext | null = null;
   private nextStartTime = 0;
   private sources = new Set<AudioBufferSourceNode>();
   private session: any = null;
-  private currentInput = '';
-  private currentOutput = '';
+  private isModelSpeaking = false;
 
   async start(
     word: string, 
     mode: 'conversation' | 'pronunciation',
-    onTranscription: (text: string, isUser: boolean, isFinal: boolean) => void
+    onTranscription: (text: string, isUser: boolean, isFinal: boolean) => void,
+    onVolume: (volume: number) => void,
+    onStatusChange: (isListening: boolean) => void,
+    onCloseRequest: () => void
   ) {
     this.inputAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
     this.outputAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
     
+    await this.inputAudioContext.resume();
+    await this.outputAudioContext.resume();
+    
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     
     const systemInstruction = mode === 'conversation' 
-      ? `You are a helpful and encouraging language tutor. The user has selected the word "${word}". 
-
-        CRITICAL: YOU MUST INITIATE THE CONVERSATION. Do not wait for the user to speak. 
-        As soon as the session starts, greet the user warmly and introduce the word "${word}". 
-        Ask them if they've heard of it or if they can try to describe what it means to them.
-
-        STRICT RULE: Wait for exactly 1 second of silence after the user finishes speaking before you respond. Never interrupt.
-        
-        Focus on helping them use "${word}" in context. If they make a mistake, gently correct them and offer praise when they succeed.`
-      : `You are a professional Pronunciation Expert and Linguist. The user is here to master the word "${word}".
-
-        CRITICAL: YOU MUST INITIATE THE SESSION. Do not wait for the user. 
-        Open the session by greeting the user and clearly stating the word "${word}" with perfect pronunciation. 
-        Then, invite the user to try saying it for you.
-
-        STRICT RULE: Wait for exactly 1 second of silence after the user finishes speaking before you respond. Never interrupt.
-
-        DIAGNOSTIC ROLE: Listen intently to their pronunciation. If they mispronounce a vowel, stress the wrong syllable, or stumble on a consonant, YOU MUST provide specific, detailed phonetic correction. 
-        Compare their attempt to the correct sounds. Ask them to repeat specific parts of the word if necessary. Be a rigorous but encouraging coach.`;
+      ? `You are a warm, supportive language tutor. The user is learning the word "${word}". 
+         YOUR ROLE:
+         - Engage in a natural, open-ended conversation.
+         - Do NOT "test" the user. Instead, elicit the use of "${word}" by talking about topics where it naturally fits.
+         - Assist the user: if they hesitate or use the word incorrectly, gently help them.
+         - When the user has demonstrated a natural and confident understanding of "${word}" (roughly 80% proficiency), say: "Great job! You've mastered this task and can move on to the next word."
+         - If the user wants to stop, call the 'closePracticeSession' function.`
+      : `You are a patient and helpful Pronunciation Coach. The user is learning "${word}".
+         YOUR ROLE:
+         - Say the word clearly and have a conversation where the user repeats it or uses it.
+         - Offer specific, friendly tips.
+         - When their pronunciation is roughly 80% accurate, say: "Flawless delivery! You've mastered this task and can move on to the next word."
+         - If the user wants to stop, call the 'closePracticeSession' function.`;
 
     const sessionPromise = this.ai.live.connect({
-      model: 'gemini-2.5-flash-native-audio-preview-09-2025',
+      model: 'gemini-2.5-flash-native-audio-preview-12-2025',
       callbacks: {
         onopen: () => {
           const source = this.inputAudioContext!.createMediaStreamSource(stream);
           const scriptProcessor = this.inputAudioContext!.createScriptProcessor(4096, 1, 1);
+          
           scriptProcessor.onaudioprocess = (e) => {
             const inputData = e.inputBuffer.getChannelData(0);
-            const l = inputData.length;
-            const int16 = new Int16Array(l);
-            for (let i = 0; i < l; i++) {
-              int16[i] = inputData[i] * 32768;
-            }
-            const pcmBlob = {
-              data: encode(new Uint8Array(int16.buffer)),
-              mimeType: 'audio/pcm;rate=16000',
-            };
-            sessionPromise.then((s) => s.sendRealtimeInput({ media: pcmBlob }));
+            let sum = 0;
+            for (let i = 0; i < inputData.length; i++) sum += inputData[i] * inputData[i];
+            const volume = Math.sqrt(sum / inputData.length);
+            onVolume(volume);
+
+            const int16 = new Int16Array(inputData.length);
+            for (let i = 0; i < inputData.length; i++) int16[i] = inputData[i] * 32768;
+            const dataBase64 = encode(new Uint8Array(int16.buffer));
+            
+            // Critical: Only send data after sessionPromise resolves to avoid race conditions.
+            sessionPromise.then((s) => {
+              s.sendRealtimeInput({
+                media: { data: dataBase64, mimeType: 'audio/pcm;rate=16000' }
+              });
+            });
           };
+
           source.connect(scriptProcessor);
           scriptProcessor.connect(this.inputAudioContext!.destination);
-
-          // Nudge the model to start if it doesn't do so automatically based on instruction
-          // We can't send a text part directly in some versions of the Live API via sendRealtimeInput,
-          // but the system instruction above is explicitly set to make the model the initiator.
         },
         onmessage: async (message: LiveServerMessage) => {
-          if (message.serverContent?.outputTranscription) {
-            this.currentOutput += message.serverContent.outputTranscription.text;
-            onTranscription(this.currentOutput, false, false);
-          } else if (message.serverContent?.inputTranscription) {
-            this.currentInput += message.serverContent.inputTranscription.text;
-            onTranscription(this.currentInput, true, false);
+          if (message.toolCall) {
+            for (const fc of message.toolCall.functionCalls) {
+              if (fc.name === 'closePracticeSession') {
+                onCloseRequest();
+                // Matching the correct response structure: functionResponses is an object.
+                sessionPromise.then(s => s.sendToolResponse({
+                  functionResponses: { id: fc.id, name: fc.name, response: { result: "ok" } }
+                }));
+              }
+            }
           }
 
-          if (message.serverContent?.turnComplete) {
-            if (this.currentInput) onTranscription(this.currentInput, true, true);
-            if (this.currentOutput) onTranscription(this.currentOutput, false, true);
-            this.currentInput = '';
-            this.currentOutput = '';
-          }
-
-          const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
-          if (base64Audio) {
-            this.nextStartTime = Math.max(this.nextStartTime, this.outputAudioContext!.currentTime);
-            const audioBuffer = await decodeAudioData(decode(base64Audio), this.outputAudioContext!, 24000, 1);
-            const source = this.outputAudioContext!.createBufferSource();
-            source.buffer = audioBuffer;
-            source.connect(this.outputAudioContext!.destination);
-            source.addEventListener('ended', () => this.sources.delete(source));
-            
-            source.start(this.nextStartTime);
-            this.nextStartTime += audioBuffer.duration;
-            this.sources.add(source);
+          const modelTurn = message.serverContent?.modelTurn;
+          if (modelTurn?.parts) {
+            for (const part of modelTurn.parts) {
+              if (part.inlineData?.data) {
+                this.isModelSpeaking = true;
+                onStatusChange(false);
+                const base64Audio = part.inlineData.data;
+                this.nextStartTime = Math.max(this.nextStartTime, this.outputAudioContext!.currentTime);
+                const audioBuffer = await decodeAudioData(decode(base64Audio), this.outputAudioContext!, 24000, 1);
+                const source = this.outputAudioContext!.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(this.outputAudioContext!.destination);
+                source.addEventListener('ended', () => {
+                  this.sources.delete(source);
+                  if (this.sources.size === 0) {
+                    this.isModelSpeaking = false;
+                    onStatusChange(true);
+                  }
+                });
+                source.start(this.nextStartTime);
+                // Correct audio scheduling: nextStartTime = nextStartTime + audioBuffer.duration
+                this.nextStartTime = this.nextStartTime + audioBuffer.duration;
+                this.sources.add(source);
+              }
+            }
           }
 
           if (message.serverContent?.interrupted) {
-            this.sources.forEach(s => s.stop());
+            this.sources.forEach(s => { try { s.stop(); } catch(e) {} });
             this.sources.clear();
             this.nextStartTime = 0;
-            this.currentInput = '';
-            this.currentOutput = '';
+            this.isModelSpeaking = false;
+            onStatusChange(true);
           }
         },
-        onerror: (e) => console.error('Live session error', e),
-        onclose: () => console.log('Live session closed'),
+        onerror: (e) => {
+          console.error('Live session error', e);
+        },
       },
       config: {
         responseModalities: [Modality.AUDIO],
+        tools: [{ functionDeclarations: [closeSessionDeclaration] }],
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
         },
-        inputAudioTranscription: {},
-        outputAudioTranscription: {},
         systemInstruction: systemInstruction,
       },
     });
@@ -164,10 +192,8 @@ export class LiveSessionManager {
   }
 
   stop() {
-    if (this.session) {
-      this.session.close();
-    }
-    this.sources.forEach(s => s.stop());
+    if (this.session) { try { this.session.close(); } catch(e) {} }
+    this.sources.forEach(s => { try { s.stop(); } catch(e) {} });
     this.sources.clear();
     if (this.inputAudioContext) this.inputAudioContext.close();
     if (this.outputAudioContext) this.outputAudioContext.close();
